@@ -42,6 +42,12 @@ import {
   s3,
   types,
 } from "@pulumi/aws";
+import {
+  S3Client,
+  HeadObjectCommand,
+  PutObjectCommand,
+} from "@aws-sdk/client-s3";
+import { useClient } from "./helpers/client.js";
 import { Permission, permission } from "./permission.js";
 import { Vpc } from "./vpc.js";
 import { Image } from "@pulumi/docker-build";
@@ -2522,9 +2528,51 @@ export class Function extends Component implements Link.Linkable {
             const hash = crypto.createHash("sha256");
             hash.update(await fs.promises.readFile(zipPath));
             const hashValue = hash.digest("hex");
-            const assetBucket = region.apply((region) =>
-              bootstrap.forRegion(region).then((d) => d.asset),
-            );
+            const assetBucket = await bootstrap
+              .forRegion(regionName)
+              .then((d) => d.asset);
+            const assetKey = dev
+              ? `assets/dev-bridge-code-${hashValue}.zip`
+              : `assets/${name}-code-${hashValue}.zip`;
+
+            // The bootstrap asset bucket is shared account-wide and its
+            // objects can disappear out of band: an S3 lifecycle rule
+            // expiring old assets, or another stage's `sst remove` deleting
+            // a key it shares with this stage (the dev-bridge zip is one
+            // content-addressed key for every app/stage in the region).
+            // Pulumi state still records the object as uploaded, so
+            // BucketObjectv2 alone never re-uploads it and the next Lambda
+            // create/update fails with NoSuchKey. Self-heal: re-put the
+            // object when it is missing. Keys are content-addressed, so
+            // concurrent heals write identical bytes and are safe.
+            try {
+              const s3Client = useClient(S3Client, { region: regionName });
+              await s3Client
+                .send(
+                  new HeadObjectCommand({ Bucket: assetBucket, Key: assetKey }),
+                )
+                .catch(async (e: any) => {
+                  if (
+                    e.name !== "NotFound" &&
+                    e.$metadata?.httpStatusCode !== 404
+                  )
+                    throw e;
+                  await s3Client.send(
+                    new PutObjectCommand({
+                      Bucket: assetBucket,
+                      Key: assetKey,
+                      Body: await fs.promises.readFile(zipPath),
+                    }),
+                  );
+                });
+            } catch (e: any) {
+              // Never fail the deploy on the heal itself — the
+              // BucketObjectv2 below stays the source of truth and
+              // surfaces real errors (e.g. missing permissions).
+              warnOnce(
+                `Could not verify s3://${assetBucket}/${assetKey} exists (${e.name ?? e}); if the object was deleted out-of-band the Lambda may fail with NoSuchKey.`,
+              );
+            }
             if (logGroupArn && sourcemaps) {
               let index = 0;
               for (const file of sourcemaps) {
@@ -2548,15 +2596,23 @@ export class Function extends Component implements Link.Linkable {
                 ? `DevBridgeCode${logicalName(regionName)}${logicalName(path.basename(bundle))}`
                 : `${name}Code`,
               {
-                key: dev
-                  ? `assets/dev-bridge-code-${hashValue}.zip`
-                  : interpolate`assets/${name}-code-${hashValue}.zip`,
+                key: assetKey,
                 bucket: assetBucket,
                 source: new asset.FileArchive(zipPath),
               },
+              // retainOnDelete: the object's key is content-addressed and
+              // shared across stages (and, for the dev bridge, across every
+              // app in the region), so one stage's `sst remove` must not
+              // delete an object other stages still reference. Orphaned
+              // objects are reclaimed by the bucket's lifecycle expiry rule,
+              // and the self-heal above re-uploads anything still in use.
               dev
-                ? { parent: rootStackResource, provider: opts?.provider }
-                : { parent },
+                ? {
+                    parent: rootStackResource,
+                    provider: opts?.provider,
+                    retainOnDelete: true,
+                  }
+                : { parent, retainOnDelete: true },
             );
           }
         },
