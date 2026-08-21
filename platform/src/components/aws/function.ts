@@ -2552,10 +2552,11 @@ export class Function extends Component implements Link.Linkable {
                   new HeadObjectCommand({ Bucket: assetBucket, Key: assetKey }),
                 )
                 .catch(async (e: any) => {
-                  if (
-                    e.name !== "NotFound" &&
-                    e.$metadata?.httpStatusCode !== 404
-                  )
+                  // HeadObject returns 403 instead of 404 for a missing key
+                  // when the caller lacks s3:ListBucket, so 403 also counts
+                  // as possibly-missing.
+                  const status = e.$metadata?.httpStatusCode;
+                  if (e.name !== "NotFound" && status !== 404 && status !== 403)
                     throw e;
                   await s3Client.send(
                     new PutObjectCommand({
