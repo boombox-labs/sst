@@ -2536,8 +2536,8 @@ export class Function extends Component implements Link.Linkable {
               : `assets/${name}-code-${hashValue}.zip`;
 
             // The bootstrap asset bucket is shared account-wide and its
-            // objects can disappear out of band: an S3 lifecycle rule
-            // expiring old assets, or another stage's `sst remove` deleting
+            // objects can disappear out of band: a user-added S3 lifecycle
+            // rule expiring old assets, or another stage's `sst remove` deleting
             // a key it shares with this stage (the dev-bridge zip is one
             // content-addressed key for every app/stage in the region).
             // Pulumi state still records the object as uploaded, so
@@ -2604,9 +2604,10 @@ export class Function extends Component implements Link.Linkable {
               // retainOnDelete: the object's key is content-addressed and
               // shared across stages (and, for the dev bridge, across every
               // app in the region), so one stage's `sst remove` must not
-              // delete an object other stages still reference. Orphaned
-              // objects are reclaimed by the bucket's lifecycle expiry rule,
-              // and the self-heal above re-uploads anything still in use.
+              // delete an object other stages still reference. SST does not
+              // configure a lifecycle rule on the bootstrap bucket, so
+              // orphaned objects accumulate until a user adds an expiry rule;
+              // the self-heal above re-uploads anything still in use.
               dev
                 ? {
                     parent: rootStackResource,
