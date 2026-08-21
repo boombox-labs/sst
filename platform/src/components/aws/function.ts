@@ -15,6 +15,7 @@ import {
   secret,
   unsecret,
   rootStackResource,
+  runtime as pulumiRuntime,
 } from "@pulumi/pulumi";
 import { bootstrap } from "./helpers/bootstrap.js";
 import {
@@ -2545,34 +2546,45 @@ export class Function extends Component implements Link.Linkable {
             // create/update fails with NoSuchKey. Self-heal: re-put the
             // object when it is missing. Keys are content-addressed, so
             // concurrent heals write identical bytes and are safe.
-            try {
-              const s3Client = useClient(S3Client, { region: regionName });
-              await s3Client
-                .send(
-                  new HeadObjectCommand({ Bucket: assetBucket, Key: assetKey }),
-                )
-                .catch(async (e: any) => {
-                  // HeadObject returns 403 instead of 404 for a missing key
-                  // when the caller lacks s3:ListBucket, so 403 also counts
-                  // as possibly-missing.
-                  const status = e.$metadata?.httpStatusCode;
-                  if (e.name !== "NotFound" && status !== 404 && status !== 403)
-                    throw e;
-                  await s3Client.send(
-                    new PutObjectCommand({
+            // Skip during preview (`sst diff`) — a dry run must not
+            // write to S3; the heal runs on the actual deploy.
+            if (!pulumiRuntime.isDryRun()) {
+              try {
+                const s3Client = useClient(S3Client, { region: regionName });
+                await s3Client
+                  .send(
+                    new HeadObjectCommand({
                       Bucket: assetBucket,
                       Key: assetKey,
-                      Body: await fs.promises.readFile(zipPath),
                     }),
-                  );
-                });
-            } catch (e: any) {
-              // Never fail the deploy on the heal itself — the
-              // BucketObjectv2 below stays the source of truth and
-              // surfaces real errors (e.g. missing permissions).
-              warnOnce(
-                `Could not verify s3://${assetBucket}/${assetKey} exists (${e.name ?? e}); if the object was deleted out-of-band the Lambda may fail with NoSuchKey.`,
-              );
+                  )
+                  .catch(async (e: any) => {
+                    // HeadObject returns 403 instead of 404 for a missing key
+                    // when the caller lacks s3:ListBucket, so 403 also counts
+                    // as possibly-missing.
+                    const status = e.$metadata?.httpStatusCode;
+                    if (
+                      e.name !== "NotFound" &&
+                      status !== 404 &&
+                      status !== 403
+                    )
+                      throw e;
+                    await s3Client.send(
+                      new PutObjectCommand({
+                        Bucket: assetBucket,
+                        Key: assetKey,
+                        Body: await fs.promises.readFile(zipPath),
+                      }),
+                    );
+                  });
+              } catch (e: any) {
+                // Never fail the deploy on the heal itself — the
+                // BucketObjectv2 below stays the source of truth and
+                // surfaces real errors (e.g. missing permissions).
+                warnOnce(
+                  `Could not verify s3://${assetBucket}/${assetKey} exists (${e.name ?? e}); if the object was deleted out-of-band the Lambda may fail with NoSuchKey.`,
+                );
+              }
             }
             if (logGroupArn && sourcemaps) {
               let index = 0;
