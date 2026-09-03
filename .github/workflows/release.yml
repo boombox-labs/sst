@@ -15,6 +15,11 @@ permissions:
 
 jobs:
   goreleaser:
+    # Upstream-only. This job publishes to npm, PyPI and crates.io, pushes to
+    # GHCR and posts to Discord, and the trigger above matches ANY tag — so on
+    # the fork it would fire on our own release tags. Fork builds live in
+    # boompop-release.yml.
+    if: github.repository == 'anomalyco/sst'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

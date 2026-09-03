@@ -1,0 +1,108 @@
+name: boompop release
+
+# Builds this fork's CLI and attaches the binaries to a GitHub release.
+# Consumers run it by pointing SST_BIN_PATH at the extracted `sst` (the npm
+# shim, node_modules/sst/bin/sst.mjs, honours that variable), so `bunx sst
+# deploy` keeps working unchanged: mercury's autodeploy action and
+# bin/mercury.sh's fast-dev path.
+#
+# Tag as `boompop-v<upstream version>-<n>` (e.g. boompop-v4.17.1-1) so the base
+# the fork carries stays legible. The inherited upstream `release.yml` triggers
+# on any tag, so it is guarded to anomalyco/sst and cannot fire on these.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "boompop-v*"
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ">=1.23.2"
+          cache: true
+
+      # platform/scripts/build ends in a multi-arch `docker buildx build` of the
+      # bridge-task image. Nothing is pushed (DOCKER_PUSH is unset), but buildx
+      # still needs QEMU for the arm64 leg.
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download Go modules
+        run: go mod download
+
+      # Must precede `go build` — cmd/sst embeds platform/dist.
+      - name: Build platform
+        run: ./platform/scripts/build
+
+      - name: Build CLI
+        run: |
+          mkdir -p dist
+          for target in linux/amd64:sst-linux-x64 linux/arm64:sst-linux-arm64 darwin/arm64:sst-darwin-arm64; do
+            platform="${target%%:*}"
+            name="${target##*:}"
+            GOOS="${platform%%/*}" GOARCH="${platform##*/}" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" -o "dist/${name}/sst" ./cmd/sst
+            tar -czf "dist/${name}.tar.gz" -C "dist/${name}" sst
+          done
+          cd dist && sha256sum ./*.tar.gz > checksums.txt
+
+      # No `-X main.version`: the CLI keeps its built-in "dev" version on
+      # purpose. A stamped version makes main() forward to node_modules/.bin/sst
+      # whenever one exists — silently running stock SST instead of this build —
+      # and makes the bundler's version check reject a repo whose `sst` package
+      # doesn't match the CLI.
+      - name: Report build identity
+        run: |
+          file dist/sst-linux-x64/sst dist/sst-linux-arm64/sst dist/sst-darwin-arm64/sst
+          ./dist/sst-linux-x64/sst version
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sst-cli
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          retention-days: 30
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/boompop-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/sst-linux-x64.tar.gz \
+            dist/sst-linux-arm64.tar.gz \
+            dist/sst-darwin-arm64.tar.gz \
+            dist/checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "SST CLI built from \`$GITHUB_SHA\`.
+
+          Extract and point \`SST_BIN_PATH\` at the \`sst\` binary; the CLI reports its version as \`dev\` by design (see boompop-release.yml)."
